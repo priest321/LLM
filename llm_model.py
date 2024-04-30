@@ -7,22 +7,23 @@ import requests
 import pandas as pd
 import math
 import json
-
+import random
 FILE_PATH = "sales_testbook.txt"
-EMBEDDING_PATH = "embedding.json"
+
 # hyperparamemters
 BATCH_SIZE = 4
 CTX_LENGTH = 64
 NUM_BLOCK = 8
-D_MODEL = 16 # should be 128
+D_MODEL = 128 # should be 512
 NUM_HEAD = 4
 HEAD_SIZE = int(D_MODEL/NUM_HEAD)
 LR = 0.001
 DROP_OUT = 0.1
-EVAL_ITERS = 20
-EVAL_MAX = 2000
+EVAL_ITERS = 50
+EVAL_MAX = 500
 PUNCTUATION = [",", ".", "!", ":", "!", "\n"]
 TEXT = []
+TEMPERATURE = 1.0
 TORCH_SEED = 1337
 torch.manual_seed(TORCH_SEED)
 
@@ -84,6 +85,7 @@ class MultiHeadModule(nn.Module):
         self.dropout = nn.Dropout(DROP_OUT)
         
     def forward(self, x):
+        # reshape multihead back to original shape
         out = torch.cat([head(x) for head in self.heads], dim=-1)
         out = self.Wo_layer(out)
         out = self.dropout(out)
@@ -118,14 +120,14 @@ class LLMModel(nn.Module):
         self.tokenized_text = []
         self.max_token_value = None
         self.token_embedding_table = None
+        # unpack list of transformer blocks and layerNorm
         self.transformer_blocks = nn.Sequential(*(
                         [TransformerBlock() for block in range(NUM_BLOCK)]+[nn.LayerNorm(D_MODEL)]))
-        self.normlayer = nn.LayerNorm(D_MODEL)
         
         self.embedding_text(text)
         self.get_token_embedding_table()
         
-        self.dimonsion_to_all_word_layer = nn.Linear(D_MODEL, self.max_token_value)
+        self.dimontion_to_all_words_layer = nn.Linear(D_MODEL, self.max_token_value)
     
     def get_token_embedding_table(self):
         tokenized_text = torch.tensor(self.tokenized_text+1, dtype=torch.long, device=DEVICE)
@@ -161,82 +163,90 @@ class LLMModel(nn.Module):
         return position_embedding
         
     def forward(self, idx, targets=None):
+        loss = None
         position_embedding = self.word_position_embedding(idx)
         x = self.token_embedding_table(idx) + position_embedding
-        x = self.transformer_blocks(x)
+        x_output = self.transformer_blocks(x)
         
-        logits = self.dimonsion_to_all_word_layer(x)
+        logits = self.dimontion_to_all_words_layer(x_output)
         
         if targets != None:
-            B, T, C = logits.shape
-            logits_reshaped = logits.view(B*T, C)
-            targets_reshaped = targets.view(B*T)
+            batch, ctx_len, max_token_len = logits.shape
+            logits_reshaped = logits.reshape(batch*ctx_len, max_token_len)
+            targets_reshaped = targets.reshape(batch*ctx_len)
             loss = F.cross_entropy(input=logits_reshaped, target=targets_reshaped)
-        else:
-            loss = None
+
         return logits, loss
 
-    def generate(self, idx, max_new_tokens=100):
-        for _ in range(max_new_tokens):
-            idx_crop = idx[:, -CTX_LENGTH:]
-            logits, loss = self.forward(idx_crop)
-            logits_last_timestep = logits[:, -1, :]
-            probs = F.softmax(input=logits_last_timestep, dim=-1)
-            idx_next = torch.multinomial(input=probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
+    def generate(self, idx, max_new_tokens=20):
+        output = [idx.item()]
+        for token in range(max_new_tokens):
+            logits, loss = self.forward(idx)
+            probs = F.softmax(input=logits/TEMPERATURE, dim=-1)
+            idx_next = torch.argmax(probs)
+            # probs[0][0] = probs form all words 
+            # idx_next_sample = torch.multinomial(probs[0][0], 1).item()
+            idx = torch.tensor([[idx_next.item()]], dtype=torch.long, device=DEVICE)
+            output.append(idx_next.item())
         
-
-model = LLMModel(text)
-print("max_value:", model.max_token_value)
-separate_index = int(len(model.tokenized_text)*0.9)
-train_data = model.tokenized_text[:separate_index]
-test_data = model.tokenized_text[separate_index:]
+        return " ".join([self.index_to_word[index] for index in output])
 
 
-def get_batch(data_type: str):
+def get_batch(data_type: str, train_data, test_data):
     data = train_data if data_type == "train" else test_data
     idxs = torch.randint(low=0, high=len(data) - CTX_LENGTH, size=(BATCH_SIZE,))
     return torch.stack([data[idx:idx+CTX_LENGTH] for idx in idxs]).to(DEVICE), torch.stack([data[idx+1:idx+CTX_LENGTH+1] for idx in idxs]).to(DEVICE)
 
 
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss(LLM_model, train_data, test_data):
     output = {}
-    model.eval()
+    
+    # disable learning
+    LLM_model.eval()
+
+    test_output = torch.tensor([[LLM_model.word_to_index["customer"]]], dtype=torch.long, device=DEVICE)
+    
     for data_type in ["train", "valid"]:
         losses = torch.zeros(EVAL_ITERS)
         for k in range(EVAL_ITERS):
-            x_batch, y_batch = get_batch(data_type)
-            logits, loss = model(x_batch, y_batch)
+            x_batch, y_batch = get_batch(data_type, train_data, test_data)
+            logits, loss = LLM_model(x_batch, y_batch)
+            logits
             losses[k] = loss.item()
-        
+        print(LLM_model.generate(test_output, 30))
         output[data_type] = losses.mean()
-    model.train()
+        
+    # active learning
+    LLM_model.train()
     return output
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-track_losses = []
 
-for step in range(EVAL_MAX):
-    if step % EVAL_ITERS == 0 or (step == EVAL_MAX -1):
-        e_loss = estimate_loss()
-        track_losses.append(e_loss)
-        print("steps", step, "loss", round(e_loss["train"].item(), 3), "validation loss: ", round(e_loss['valid'].item(), 3))
-    xb, yb = get_batch('train')
-    logits, loss = model(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+def get_LLM_model():
+    model = LLMModel(text)
+    print("max_token_value: ", model.max_token_value)
+    separate_index = int(len(model.tokenized_text)*0.9)
+    train_data = model.tokenized_text[:separate_index]
+    test_data = model.tokenized_text[separate_index:]
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+    track_losses = []
+    
+    # start training
+    for step in range(EVAL_MAX):
+        if step % EVAL_ITERS == 0 or (step == EVAL_MAX -1):
+            e_loss = estimate_loss(model, train_data, test_data)
+            track_losses.append(e_loss)
+            print("steps", step, "loss", round(e_loss["train"].item(), 3), "validation loss: ", round(e_loss['valid'].item(), 3))
+        xb, yb = get_batch('train', train_data, test_data)
+        logits, loss = model(xb, yb)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+    
+    torch.save(model, "LLM.pth")
 
 
-torch.save(model, "LLM.pth")
+if __name__ == "__main__":
+    get_LLM_model()
 
-model.eval()
-start = 'you can'
-start_ids = [model.word_to_index[c] for c in start.split()]
-x = (torch.tensor(start_ids, dtype=torch.long, device=DEVICE)[None, ...])
-y = model.generate(x, max_new_tokens=100)
-
-predict_result = " ".join([model.index_to_word.get(num) for num in y[0].tolist()])
-print(predict_result)
