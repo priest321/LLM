@@ -10,7 +10,8 @@ import json
 import random
 import matplotlib.pyplot as plt
 
-FILE_PATH = "sales_testbook.txt"
+FILE_PATH = "../data/sales_textbook.txt"
+MODEL_PATH = "../pretrained_model/LLM.pth"
 
 # hyperparamemters
 BATCH_SIZE = 4
@@ -21,8 +22,9 @@ NUM_HEAD = 4
 HEAD_SIZE = int(D_MODEL/NUM_HEAD)
 LR = 0.001
 DROP_OUT = 0.1
-EVAL_ITERS = 10
-EVAL_MAX = 50
+EVAL_ITERS = 20
+VALID_ITERS = 5
+EVAL_MAX = 2000
 PUNCTUATION = [",", ".", "!", ":", "!", "\n"]
 TEXT = []
 TEMPERATURE = 1.0
@@ -78,7 +80,8 @@ class AttentionModule(nn.Module):
             return output
         else:
             raise ValueError(f"Invalid input shape: {x.shape} value: {x}")
-        
+
+
 class MultiHeadModule(nn.Module):
     def __init__(self):
         super().__init__()
@@ -204,14 +207,14 @@ def get_batch(data_type: str, train_data, test_data):
 def estimate_loss(LLM_model, train_data, test_data):
     output = {"train": [], "valid": []}
     
-    # disable learning
+    # Disable learning
     LLM_model.eval()
 
     test_output = torch.tensor([[LLM_model.word_to_index["customer"]]], dtype=torch.long, device=DEVICE)
 
     for data_type in ["train", "valid"]:
-        losses = torch.zeros(EVAL_ITERS)
-        for k in range(EVAL_ITERS):
+        losses = torch.zeros(VALID_ITERS)
+        for k in range(VALID_ITERS):
             x_batch, y_batch = get_batch(data_type, train_data, test_data)
             logits, loss = LLM_model(x_batch, y_batch)
             logits
@@ -219,7 +222,7 @@ def estimate_loss(LLM_model, train_data, test_data):
         print(LLM_model.generate(test_output, 30))
         output[data_type] = losses.mean()
         
-    # active learning
+    # Active learning
     LLM_model.train()
     return output
 
@@ -251,7 +254,6 @@ def get_LLM_model():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     track_losses = []
 
-    # start training
     for step in range(EVAL_MAX):
         if step % EVAL_ITERS == 0 or (step == EVAL_MAX -1):
             e_loss = estimate_loss(model, train_data, test_data)
@@ -262,7 +264,7 @@ def get_LLM_model():
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-    torch.save(model, "LLM.pth")
+    torch.save(model, MODEL_PATH)
     
     display_graph(track_losses)
 
