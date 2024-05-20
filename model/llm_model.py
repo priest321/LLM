@@ -8,27 +8,28 @@ import pandas as pd
 import math
 import json
 import random
+from typing import Optional, Tuple
 import matplotlib.pyplot as plt
 
 FILE_PATH = "../data/sales_textbook.txt"
 MODEL_PATH = "../pretrained_model/LLM.pth"
 
 # hyperparamemters
-BATCH_SIZE = 4
-CTX_LENGTH = 64
-NUM_BLOCK = 8
-D_MODEL = 128 # should be 512
-NUM_HEAD = 4
-HEAD_SIZE = int(D_MODEL/NUM_HEAD)
-LR = 0.001
-DROP_OUT = 0.1
-EVAL_ITERS = 20
-VALID_ITERS = 5
-EVAL_MAX = 2000
-PUNCTUATION = [",", ".", "!", ":", "!", "\n"]
-TEXT = []
-TEMPERATURE = 1.0
-TORCH_SEED = 1337
+BATCH_SIZE: int = 4
+CTX_LENGTH: int = 64
+NUM_BLOCK: int = 8
+D_MODEL: int = 128 # should be 512
+NUM_HEAD: int = 4
+HEAD_SIZE: int = int(D_MODEL/NUM_HEAD)
+LR: float = 0.001
+DROP_OUT: float = 0.1
+EVAL_ITERS: int = 20
+VALID_ITERS: int = 5
+EVAL_MAX: int = 2000
+PUNCTUATION: list = [",", ".", "!", ":", "!", "\n"]
+TEXT: list = []
+TEMPERATURE: float = 1.0
+TORCH_SEED: int = 1337
 torch.manual_seed(TORCH_SEED)
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -38,7 +39,8 @@ if not os.path.exists(FILE_PATH) or os.path.getsize(FILE_PATH)<5000:
     url = "https://huggingface.co/datasets/goendalf666/sales-textbook_for_convincing_and_selling/resolve/main/sales_textbook.txt?download=true"
     with open(FILE_PATH, "wb") as f:
         f.write(requests.get(url).content)
-    
+
+
 with open(FILE_PATH, 'r') as f:
     text = f.read()
     print(len(text))
@@ -117,14 +119,14 @@ class TransformerBlock(nn.Module):
 
     
 class LLMModel(nn.Module):
-    def __init__(self, text):
+    def __init__(self, text:str):
         super().__init__()
-        self.index_to_word = {}
-        self.word_to_index = {PUNCTUATION[i]: i for i in range(len(PUNCTUATION))}
-        self.data = []
+        self.index_to_word: dict = {}
+        self.word_to_index: dict = {PUNCTUATION[i]: i for i in range(len(PUNCTUATION))}
+        self.data: list = []
         self.tokenized_text = []
-        self.max_token_value = None
-        self.token_embedding_table = None
+        self.max_token_value: Optional[int] = None
+        self.token_embedding_table: Optional = None
         # unpack list of transformer blocks and layerNorm
         self.transformer_blocks = nn.Sequential(*(
                         [TransformerBlock() for block in range(NUM_BLOCK)]+[nn.LayerNorm(D_MODEL)]))
@@ -139,7 +141,7 @@ class LLMModel(nn.Module):
         self.max_token_value = tokenized_text.max().item()
         self.token_embedding_table = nn.Embedding(self.max_token_value+1, D_MODEL)
         
-    def embedding_text(self, text):
+    def embedding_text(self, text: list):
         count = len(PUNCTUATION)
         for word in text.split(" "):
             for w in word.split("\n"):
@@ -183,25 +185,32 @@ class LLMModel(nn.Module):
 
         return logits, loss
 
-    def generate(self, idx, max_new_tokens=20):
+    def generate(self, idx, max_new_tokens=20, multinomial=False):
         output = [idx.item()]
         for token in range(max_new_tokens):
             logits, loss = self.forward(idx)
             probs = F.softmax(input=logits/TEMPERATURE, dim=-1)
-            idx_next = torch.argmax(probs)
-            # probs[0][0] = probs form all words
-            # idx_next_sample = torch.multinomial(probs[0][0], 1).item()
+            if multinomial:
+                idx_next = torch.multinomial(probs[0][0], 1, replacement=False)
+            else:
+                idx_next = torch.argmax(probs)
+
             idx = torch.tensor([[idx_next.item()]], dtype=torch.long, device=DEVICE)
             output.append(idx_next.item())
         
         return " ".join([self.index_to_word[index] for index in output])
 
-
-def get_batch(data_type: str, train_data, test_data):
+        
+def get_batch(data_type: str, train_data, test_data, step=-1):
     data = train_data if data_type == "train" else test_data
-    idxs = torch.randint(low=0, high=len(data) - CTX_LENGTH, size=(BATCH_SIZE,))
-    return torch.stack([data[idx:idx+CTX_LENGTH] for idx in idxs]).to(DEVICE), torch.stack([data[idx+1:idx+CTX_LENGTH+1] for idx in idxs]).to(DEVICE)
+    if step == -1:
+        idxs = torch.randint(low=0, high=len(data) - CTX_LENGTH, size=(BATCH_SIZE,))
+    else:
+        step = step % (len(data)//(CTX_LENGTH*BATCH_SIZE)) if step else 0
+        batch_step = BATCH_SIZE*step*CTX_LENGTH
+        idxs = [(batch_step+i*CTX_LENGTH) for i in range(1, BATCH_SIZE+1)]
 
+    return torch.stack([data[idx:idx+CTX_LENGTH] for idx in idxs]).to(DEVICE), torch.stack([data[idx+1:idx+CTX_LENGTH+1] for idx in idxs]).to(DEVICE)
 
 @torch.no_grad()
 def estimate_loss(LLM_model, train_data, test_data):
@@ -219,7 +228,8 @@ def estimate_loss(LLM_model, train_data, test_data):
             logits, loss = LLM_model(x_batch, y_batch)
             logits
             losses[k] = loss.item()
-        print(LLM_model.generate(test_output, 30))
+        print("Best token", LLM_model.generate(test_output, 30))
+        print("multinomial token", LLM_model.generate(test_output, 30, multinomial=True))
         output[data_type] = losses.mean()
         
     # Active learning
@@ -227,7 +237,7 @@ def estimate_loss(LLM_model, train_data, test_data):
     return output
 
 
-def display_graph(loss_history):
+def display_graph(loss_history: list):
     plt.figure()
     plt.subplot(1, 2, 1)
     for i in loss_history:
@@ -244,10 +254,10 @@ def display_graph(loss_history):
     plt.title("Validation Loss")
     plt.show()
 
+
 def get_LLM_model():
     model = LLMModel(text)
-    print("max_token_value: ", model.max_token_value)
-    separate_index = int(len(model.tokenized_text)*0.9)
+    separate_index = int(len(model.tokenized_text)*0.8)
     train_data = model.tokenized_text[:separate_index]
     test_data = model.tokenized_text[separate_index:]
 
@@ -259,7 +269,7 @@ def get_LLM_model():
             e_loss = estimate_loss(model, train_data, test_data)
             track_losses.append(e_loss)
             print("steps", step, "loss", round(e_loss["train"].item(), 3), "validation loss: ", round(e_loss['valid'].item(), 3))
-        xb, yb = get_batch('train', train_data, test_data)
+        xb, yb = get_batch('train', train_data, test_data, step)
         logits, loss = model(xb, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
